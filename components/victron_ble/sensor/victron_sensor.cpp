@@ -1,5 +1,6 @@
 #include "victron_sensor.h"
 #include "esphome/core/log.h"
+#include <cmath>
 
 namespace esphome {
 namespace victron_ble {
@@ -10,6 +11,51 @@ static const char *const TAG = "victron_ble.sensor";
 //   LOG_SENSOR("", "Victron Sensor", this);
 //   ESP_LOGCONFIG(TAG, "  Type '%s'", enum_to_c_str(this->type_));
 // }
+
+// Victron devices advertise about once a second. When a sensor has no value to report, only log and publish NaN
+// when it goes from valid (or no value yet) to unavailable; a later valid value re-arms this.
+// Uses the raw (pre-filter) state, as has_state() is not set while filters such as throttle_average hold values back.
+bool VictronSensor::should_report_unavailable_() {
+  if (this->invalid_reported_ && std::isnan(this->get_raw_state())) {
+    return false;
+  }
+  this->invalid_reported_ = true;
+  return true;
+}
+
+// The configured type does not exist on this device (e.g. a SmartShunt field on a solar charger).
+void VictronSensor::publish_invalid_(const char *message) {
+  if (!this->should_report_unavailable_()) {
+    return;
+  }
+  ESP_LOGW(TAG, "[%s] %s: %s Publishing NaN until this changes.", this->parent_->address_str(), this->get_name().c_str(),
+           message);
+  this->publish_state(NAN);
+}
+
+static const char *aux_input_to_str(VE_REG_BMV_AUX_INPUT aux_input) {
+  switch (aux_input) {
+    case VE_REG_BMV_AUX_INPUT::VE_REG_DC_CHANNEL2_VOLTAGE:
+      return "starter battery voltage";
+    case VE_REG_BMV_AUX_INPUT::VE_REG_BATTERY_MID_POINT_VOLTAGE:
+      return "midpoint voltage";
+    case VE_REG_BMV_AUX_INPUT::VE_REG_BAT_TEMPERATURE:
+      return "temperature";
+    default:
+      return "none";
+  }
+}
+
+// AUX_VOLTAGE / MID_VOLTAGE / TEMPERATURE share the device's single aux input. Whichever one the device is set to
+// reports values; the others are simply not in use, which is a normal configuration rather than an error.
+void VictronSensor::publish_aux_not_used_(VE_REG_BMV_AUX_INPUT aux_input) {
+  if (!this->should_report_unavailable_()) {
+    return;
+  }
+  ESP_LOGI(TAG, "[%s] %s: not in use, device aux input is set to %s.", this->parent_->address_str(),
+           this->get_name().c_str(), aux_input_to_str(aux_input));
+  this->publish_state(NAN);
+}
 
 void VictronSensor::register_callback() {
   switch (this->type_) {
@@ -23,8 +69,7 @@ void VictronSensor::register_callback() {
             this->publish_state((u_int8_t) msg->data.ve_bus.active_ac_in);
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `active ac in` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `active ac in` field.");
             break;
         }
       });
@@ -40,8 +85,7 @@ void VictronSensor::register_callback() {
             this->publish_state_(msg->data.ve_bus.active_ac_in_power);
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `ac in power` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `ac in power` field.");
             break;
         }
       });
@@ -54,8 +98,7 @@ void VictronSensor::register_callback() {
             this->publish_state_(msg->data.inverter.ac_apparent_power);
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `ac apparent power` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `ac apparent power` field.");
             break;
         }
       });
@@ -71,8 +114,7 @@ void VictronSensor::register_callback() {
             this->publish_state_(msg->data.ac_charger.ac_current);
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `ac current` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `ac current` field.");
             break;
         }
       });
@@ -91,8 +133,7 @@ void VictronSensor::register_callback() {
             this->publish_state_(msg->data.ve_bus.ac_out_power);
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `ac out power` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `ac out power` field.");
             break;
         }
       });
@@ -105,8 +146,7 @@ void VictronSensor::register_callback() {
             this->publish_state_(msg->data.inverter.ac_voltage);
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `ac voltage` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `ac voltage` field.");
             break;
         }
       });
@@ -128,8 +168,7 @@ void VictronSensor::register_callback() {
             this->publish_state((u_int16_t) msg->data.dc_energy_meter.alarm_reason);
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `alarm reason` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `alarm reason` field.");
             break;
         }
       });
@@ -140,23 +179,22 @@ void VictronSensor::register_callback() {
         switch (msg->record_type) {
           case VICTRON_BLE_RECORD_TYPE::BATTERY_MONITOR:
             if (msg->data.battery_monitor.aux_input_type == VE_REG_BMV_AUX_INPUT::VE_REG_DC_CHANNEL2_VOLTAGE) {
+              this->invalid_reported_ = false;
               this->publish_state_(msg->data.battery_monitor.aux_input.aux_voltage);
             } else {
-              ESP_LOGW(TAG, "[%s] Incorrect Aux input configuration.", this->parent_->address_str());
-              this->publish_state(NAN);
+              this->publish_aux_not_used_(msg->data.battery_monitor.aux_input_type);
             }
             break;
           case VICTRON_BLE_RECORD_TYPE::DC_ENERGY_METER:
             if (msg->data.dc_energy_meter.aux_input_type == VE_REG_BMV_AUX_INPUT::VE_REG_DC_CHANNEL2_VOLTAGE) {
+              this->invalid_reported_ = false;
               this->publish_state_(msg->data.dc_energy_meter.aux_input.aux_voltage);
             } else {
-              ESP_LOGW(TAG, "[%s] Incorrect Aux input configuration.", this->parent_->address_str());
-              this->publish_state(NAN);
+              this->publish_aux_not_used_(msg->data.dc_energy_meter.aux_input_type);
             }
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `aux voltage` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `aux voltage` field.");
             break;
         }
       });
@@ -190,8 +228,7 @@ void VictronSensor::register_callback() {
             this->publish_state_(msg->data.dc_energy_meter.battery_current);
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `battery current` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `battery current` field.");
             break;
         }
       });
@@ -231,8 +268,7 @@ void VictronSensor::register_callback() {
             this->publish_state_(msg->data.dc_energy_meter.battery_voltage);
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `battery voltage` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `battery voltage` field.");
             break;
         }
       });
@@ -266,8 +302,7 @@ void VictronSensor::register_callback() {
             this->publish_state_(msg->data.dc_energy_meter.battery_current, msg->data.dc_energy_meter.battery_voltage);
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `battery power` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `battery power` field.");
             break;
         }
       });
@@ -298,8 +333,7 @@ void VictronSensor::register_callback() {
             this->publish_state((u_int8_t) msg->data.orion_xs.charger_error);
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `charger error` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `charger error` field.");
             break;
         }
       });
@@ -315,8 +349,7 @@ void VictronSensor::register_callback() {
             this->publish_state_(msg->data.lynx_smart_bms.consumed_ah);
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `consumed Ah` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `consumed Ah` field.");
             break;
         }
       });
@@ -353,8 +386,7 @@ void VictronSensor::register_callback() {
             this->publish_state((u_int8_t) msg->data.orion_xs.device_state);
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `device state` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `device state` field.");
             break;
         }
       });
@@ -376,8 +408,7 @@ void VictronSensor::register_callback() {
             this->publish_state((u_int8_t) msg->data.ve_bus.ve_bus_error);
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `error` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `error` field.");
             break;
         }
       });
@@ -396,8 +427,7 @@ void VictronSensor::register_callback() {
             this->publish_state_(msg->data.orion_xs.input_voltage);
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `input voltage` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `input voltage` field.");
             break;
         }
       });
@@ -410,8 +440,7 @@ void VictronSensor::register_callback() {
             this->publish_state_(msg->data.solar_charger.load_current);
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `load current` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `load current` field.");
             break;
         }
       });
@@ -424,8 +453,7 @@ void VictronSensor::register_callback() {
             this->publish_state_(msg->data.solar_charger.load_current, msg->data.solar_charger.battery_voltage);
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `load current` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `load current` field.");
             break;
         }
       });
@@ -436,15 +464,14 @@ void VictronSensor::register_callback() {
         switch (msg->record_type) {
           case VICTRON_BLE_RECORD_TYPE::BATTERY_MONITOR:
             if (msg->data.battery_monitor.aux_input_type == VE_REG_BMV_AUX_INPUT::VE_REG_BATTERY_MID_POINT_VOLTAGE) {
+              this->invalid_reported_ = false;
               this->publish_state_(msg->data.battery_monitor.aux_input.mid_voltage);
             } else {
-              ESP_LOGW(TAG, "[%s] Incorrect Aux input configuration.", this->parent_->address_str());
-              this->publish_state(NAN);
+              this->publish_aux_not_used_(msg->data.battery_monitor.aux_input_type);
             }
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `mid voltage` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `mid voltage` field.");
             break;
         }
       });
@@ -463,8 +490,7 @@ void VictronSensor::register_callback() {
             this->publish_state_(msg->data.orion_xs.output_voltage);
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `output voltage` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `output voltage` field.");
             break;
         }
       });
@@ -483,8 +509,7 @@ void VictronSensor::register_callback() {
             this->publish_state((u_int32_t) msg->data.orion_xs.off_reason);
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `off reason` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `off reason` field.");
             break;
         }
       });
@@ -503,8 +528,7 @@ void VictronSensor::register_callback() {
             this->publish_state_(msg->data.multi_rs.pv_power);
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `PV power` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `PV power` field.");
             break;
         }
       });
@@ -523,8 +547,7 @@ void VictronSensor::register_callback() {
             this->publish_state_(msg->data.ve_bus.soc);
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `state of charge` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `state of charge` field.");
             break;
         }
       });
@@ -535,10 +558,10 @@ void VictronSensor::register_callback() {
         switch (msg->record_type) {
           case VICTRON_BLE_RECORD_TYPE::BATTERY_MONITOR:
             if (msg->data.battery_monitor.aux_input_type == VE_REG_BMV_AUX_INPUT::VE_REG_BAT_TEMPERATURE) {
+              this->invalid_reported_ = false;
               this->publish_state_(msg->data.battery_monitor.aux_input.temperature);
             } else {
-              ESP_LOGW(TAG, "[%s] Incorrect Aux input configuration.", this->parent_->address_str());
-              this->publish_state(NAN);
+              this->publish_aux_not_used_(msg->data.battery_monitor.aux_input_type);
             }
             break;
           case VICTRON_BLE_RECORD_TYPE::AC_CHARGER:
@@ -555,15 +578,14 @@ void VictronSensor::register_callback() {
             break;
           case VICTRON_BLE_RECORD_TYPE::DC_ENERGY_METER:
             if (msg->data.dc_energy_meter.aux_input_type == VE_REG_BMV_AUX_INPUT::VE_REG_BAT_TEMPERATURE) {
+              this->invalid_reported_ = false;
               this->publish_state_(msg->data.dc_energy_meter.aux_input.temperature);
             } else {
-              ESP_LOGW(TAG, "[%s] Incorrect Aux input configuration.", this->parent_->address_str());
-              this->publish_state(NAN);
+              this->publish_aux_not_used_(msg->data.dc_energy_meter.aux_input_type);
             }
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `temperature` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `temperature` field.");
             break;
         }
       });
@@ -579,8 +601,7 @@ void VictronSensor::register_callback() {
             this->publish_state_(msg->data.lynx_smart_bms.ttg);
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `time to go` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `time to go` field.");
             break;
         }
       });
@@ -599,8 +620,7 @@ void VictronSensor::register_callback() {
             this->publish_state_(msg->data.multi_rs.yield_today);
             break;
           default:
-            ESP_LOGW(TAG, "[%s] Device has no `yield today` field.", this->parent_->address_str());
-            this->publish_state(NAN);
+            this->publish_invalid_("Device has no `yield today` field.");
             break;
         }
       });

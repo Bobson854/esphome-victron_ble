@@ -219,8 +219,12 @@ class VictronSensor : public sensor::Sensor, public Parented<VictronBle> {
 
  protected:
   VICTRON_SENSOR_TYPE type_;
+  bool invalid_reported_{false};
 
   void register_callback();
+  bool should_report_unavailable_();
+  void publish_invalid_(const char *message);
+  void publish_aux_not_used_(VE_REG_BMV_AUX_INPUT aux_input);
 
   inline void publish_state_(vic_22bit_0_001 val) {
     if (val == 0x3FFFFF) {
