@@ -76,6 +76,8 @@ class VictronTextSensor : public text_sensor::TextSensor, public Parented<Victro
 
   void register_callback();
 
+  void publish_if_changed_(const std::string &state);
+
   void publish_state_(VE_REG_ALARM_REASON val);
   void publish_state_(VE_REG_DEVICE_STATE val);
   void publish_state_(VE_REG_CHR_ERROR_CODE val);
